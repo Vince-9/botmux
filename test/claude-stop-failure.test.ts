@@ -193,9 +193,9 @@ describe('decideClaudeStopFailureFallback', () => {
 });
 
 describe('handleClaudeStopFailureReport', () => {
-  function harness(opts: { settled?: boolean; surfacedBy?: 'before' | 'catch-up' } = {}) {
+  function harness(opts: { settled?: 'completed' | 'failed'; surfacedBy?: 'before' | 'catch-up' } = {}) {
     const timers: Array<{ delayMs: number; run: () => void }> = [];
-    const settled = new Set<string>(opts.settled ? ['om_failed'] : []);
+    const settled = new Map<string, string>(opts.settled ? [['om_failed', opts.settled]] : []);
     let clock = 1_000_000;
     let surfacedAt: number | undefined = opts.surfacedBy === 'before' ? clock - 1_000 : undefined;
     const emitted: unknown[][] = [];
@@ -207,9 +207,9 @@ describe('handleClaudeStopFailureReport', () => {
       schedule: (delayMs: number, run: () => void) => { timers.push({ delayMs, run }); return timers.length; },
       // The bridge reading its last bytes is what settles a transcript that was only behind.
       catchUp: () => {
-        if (opts.surfacedBy === 'catch-up') { settled.add('om_failed'); surfacedAt = clock; }
+        if (opts.surfacedBy === 'catch-up') { settled.set('om_failed', 'failed'); surfacedAt = clock; }
       },
-      isSettled: (turnId: string) => settled.has(turnId),
+      settledStatus: (turnId: string) => settled.get(turnId),
       cliIdle: () => idle,
       lastFailureSurfacedAtMs: () => surfacedAt,
       now: () => clock,
@@ -239,7 +239,7 @@ describe('handleClaudeStopFailureReport', () => {
 
   it('sends nothing when the transcript surfaced the failure, just before the report or on the catch-up read', () => {
     for (const surfacedBy of ['before', 'catch-up'] as const) {
-      const { ctx, timers, emitted, notices } = harness({ settled: surfacedBy === 'before', surfacedBy });
+      const { ctx, timers, emitted, notices } = harness({ settled: surfacedBy === 'before' ? 'failed' : undefined, surfacedBy });
       handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
       ctx.advance(CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS);
       timers[0].run();
@@ -248,8 +248,19 @@ describe('handleClaudeStopFailureReport', () => {
     }
   });
 
-  it('does not take a failure surfaced long before the report for this one', () => {
-    const { ctx, timers, notices } = harness({ settled: true });
+  it('counts the frozen turn\'s own failed terminal as surfaced, however late the report', () => {
+    // A hook client that started unusually slowly reports long after the
+    // transcript failed this very turn.
+    const { ctx, timers, emitted, notices } = harness({ settled: 'failed' });
+    ctx.lastFailureSurfacedAtMs = () => ctx.now() - 10 * CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS;
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
+    timers[0].run();
+    expect(emitted).toEqual([]);
+    expect(notices).toEqual([]);
+  });
+
+  it('does not take another failure surfaced long before the report for this one', () => {
+    const { ctx, timers, notices } = harness({ settled: 'completed' });
     ctx.lastFailureSurfacedAtMs = () => ctx.now() - 10 * CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS;
     handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
     timers[0].run();
@@ -257,7 +268,7 @@ describe('handleClaudeStopFailureReport', () => {
   });
 
   it('notifies instead of re-settling a turn that was already closed without the failure', () => {
-    const { ctx, timers, emitted, notices } = harness({ settled: true });
+    const { ctx, timers, emitted, notices } = harness({ settled: 'completed' });
     handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx);
     timers[0].run();
     expect(emitted).toEqual([]);

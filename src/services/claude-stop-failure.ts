@@ -223,7 +223,9 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
   /** Read transcript bytes the watcher has not consumed yet; a transcript
    *  that is merely behind then settles the turn itself. */
   catchUp: () => void;
-  isSettled: (turnId: string, dispatchAttempt?: number) => boolean;
+  /** Status of the terminal already emitted for the turn; undefined while it
+   *  has none. */
+  settledStatus: (turnId: string, dispatchAttempt?: number) => string | undefined;
   /** The CLI is back at its prompt. */
   cliIdle: () => boolean;
   /** When the worker last emitted a failed/ambiguous terminal or a failure
@@ -279,7 +281,8 @@ export function handleClaudeStopFailureReport<TTimer>(
   const { dispatchAttempt } = active;
   const replyTurnId = claimedTurn.turnId ?? active.turnId;
   // The transcript surfaces this failure within a second or two of it, on
-  // either side of the report (see above).
+  // either side of the report (see above). This window only matters for a
+  // failure surfaced on another turn (a local-turn notice, an absorbed input).
   const surfacedSinceMs = ctx.now() - CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS;
   const outcome = classifyClaudeStopFailure(report);
   ctx.log(`Claude StopFailure (${report.error}) for turn ${turnId?.slice(0, 12) ?? '-'}; `
@@ -290,12 +293,16 @@ export function handleClaudeStopFailureReport<TTimer>(
     } catch (err) {
       ctx.log(`Claude StopFailure catch-up read failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    const settledStatus = turnId ? ctx.settledStatus(turnId, dispatchAttempt) : undefined;
     const decision = decideClaudeStopFailureFallback({
       outcome,
       turnId,
-      settled: !!turnId && ctx.isSettled(turnId, dispatchAttempt),
+      settled: settledStatus !== undefined,
       cliIdle: ctx.cliIdle(),
-      surfaced: (ctx.lastFailureSurfacedAtMs() ?? -Infinity) >= surfacedSinceMs,
+      // The frozen turn already failed: that is this failure, however late the
+      // report. Otherwise only a failure surfaced around the report counts.
+      surfaced: settledStatus === 'failed' || settledStatus === 'ambiguous'
+        || (ctx.lastFailureSurfacedAtMs() ?? -Infinity) >= surfacedSinceMs,
     });
     switch (decision.action) {
       case 'skip':

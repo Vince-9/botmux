@@ -18532,7 +18532,7 @@ function handleClaudeStopFailure(msg: Extract<DaemonToWorker, { type: 'claude_st
     activeTurn: { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
     schedule: (delayMs, run) => setTimeout(run, delayMs),
     catchUp: () => { if (bridgeJsonlPath) bridgeIngest(); },
-    isSettled: (turnId, dispatchAttempt) => emittedTurnTerminals.has(sessionId, turnId, dispatchAttempt),
+    settledStatus: (turnId, dispatchAttempt) => emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt),
     cliIdle: () => isPromptReady,
     lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
     now: Date.now,
@@ -27027,7 +27027,7 @@ function emitTurnTerminal(
     { turnId, dispatchAttempt },
     cliSpawnGeneration,
   );
-  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt)) {
+  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt, status)) {
     // A duplicate terminal must not leave the start armed: the first emission
     // already published this turn's timing and consumed the entry, but a
     // *replay* whose first emission never ran through this path could.
