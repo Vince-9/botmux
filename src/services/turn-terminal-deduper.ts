@@ -1,3 +1,7 @@
+function terminalKey(sessionId: string, turnId: string, dispatchAttempt?: number): string {
+  return `${sessionId}:${turnId}:${dispatchAttempt ?? 'generic'}`;
+}
+
 /** Bounded worker-local exactly-once gate for terminal IPC emission. */
 export class TurnTerminalDeduper {
   private readonly emitted = new Set<string>();
@@ -15,7 +19,7 @@ export class TurnTerminalDeduper {
    */
   claim(sessionId: string, turnId: string, dispatchAttempt?: number): boolean {
     if (!sessionId || !turnId) return false;
-    const key = `${sessionId}:${turnId}:${dispatchAttempt ?? 'generic'}`;
+    const key = terminalKey(sessionId, turnId, dispatchAttempt);
     if (this.emitted.has(key)) return false;
     this.emitted.add(key);
     if (this.emitted.size > this.maxEntries) {
@@ -23,6 +27,11 @@ export class TurnTerminalDeduper {
       if (oldest !== undefined) this.emitted.delete(oldest);
     }
     return true;
+  }
+
+  /** Whether this terminal was already claimed, without claiming it. */
+  has(sessionId: string, turnId: string, dispatchAttempt?: number): boolean {
+    return !!sessionId && !!turnId && this.emitted.has(terminalKey(sessionId, turnId, dispatchAttempt));
   }
 
   size(): number {

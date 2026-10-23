@@ -16607,6 +16607,23 @@ async function postSessionScopedSignal(
   } catch { /* daemon 不可达 → 放弃，worker 走超时兜底 */ }
 }
 
+// ─── botmux __claude-stop-failure-v1 ─────────────────────────────────────────────
+//
+// Claude Code `StopFailure` hook 客户端（见 services/claude-stop-failure.ts）：回合因
+// API 错误结束时 Claude 跑它而不跑 Stop。本命令只把错误类型与发起方身份
+// （session_id / transcript_path / CLAUDE_PID）搬给本会话 worker，兜底与否由 worker
+// 在 transcript 宽限期后决定。回合身份沿用 session-ready 的 origin 解析（worker 发布
+// 的 active-turn marker）；Claude 不等这个 hook，marker 可能已指向下一条排队输入，
+// worker 侧会据此只做提示、不收口回合。fail-open：env 缺失、载荷无法解析、daemon
+// 不可达都静默 exit 0（StopFailure 的输出与退出码 Claude 本就忽略）。
+async function cmdClaudeStopFailure(): Promise<void> {
+  const payloadText = (await readStdinWithTimeout(2000)).toString('utf-8');
+  const { parseClaudeStopFailureHookInput } = await import('./services/claude-stop-failure.js');
+  const report = parseClaudeStopFailureHookInput(payloadText, process.env.CLAUDE_PID);
+  if (report) await postSessionScopedSignal('/api/claude-stop-failure', { ...report });
+  process.exit(0);
+}
+
 // ─── botmux __turn-idle-v2 ──────────────────────────────────────────────────────
 //
 // CLI 进程内的**结构化回合空闲**上报客户端。当前唯一调用方是 dsh-tui 的 cordis
@@ -17967,6 +17984,10 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // branch's plugin lookup can never match it.
     '__turn-idle-v2',
     '__cursor-usage-v1', // local, session-scoped usage callback; no messaging
+    // Claude StopFailure hook client: forwards the failed turn's error type to
+    // this session's worker. Local and session-scoped like `session-ready`; the
+    // worker decides whether the turn still needs a terminal.
+    '__claude-stop-failure-v1',
     // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
     // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
     // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
@@ -19234,6 +19255,11 @@ switch (command) {
     // `botmux user-prompt-hook` — Claude 家族 UserPromptSubmit hook 客户端，
     // 按内容指纹读回 per-turn sidecar 并注入为该轮 system-reminder（#794）。
     await cmdUserPromptHook();
+    break;
+  }
+  case '__claude-stop-failure-v1': {
+    // `botmux __claude-stop-failure-v1` — Claude StopFailure hook 客户端（API 错误结束的回合）。
+    await cmdClaudeStopFailure();
     break;
   }
   case '__cursor-usage-v1': {

@@ -180,6 +180,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
+import { handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import {
   appendBridgeTurnJournalEntry,
@@ -9233,6 +9234,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean; releaseHeldTermi
           ...(notice.replyTurnId ? { turnId: notice.replyTurnId } : {}),
           message: t('worker.local_turn_failed', { cliName: cliName(), errorCode: notice.errorCode }),
         });
+        lastTurnFailureSurfacedAtMs = Date.now();
         continue;
       }
       log(`Bridge terminal suppressed for synthesised local turn ${turn.turnId.substring(0, 8)} `
@@ -18510,6 +18512,46 @@ function postTerminalPromptFenceHolds(
   }
 }
 
+/** Claude ended a turn on an API error (`StopFailure` hook; it does not run
+ *  `Stop` hooks there). The transcript normally surfaces that failure on its
+ *  own API-error record; when the bridge has lost the turn nothing would, so
+ *  after a grace period the hook settles the open turn instead — the daemon
+ *  then continues or reports it like any other failed terminal — or, with no
+ *  open turn left, tells the chat. See services/claude-stop-failure.ts. */
+function handleClaudeStopFailure(msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>): void {
+  if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) {
+    log(`Ignoring Claude StopFailure (${msg.report.error}): not a botmux-driven Claude session`);
+    return;
+  }
+  const cliSessionIds = new Set(bridgeKnownSessionIds);
+  for (const sid of [lastSpawnEffectiveCliSessionId, lastInitConfig?.cliSessionId]) {
+    if (sid) cliSessionIds.add(sid);
+  }
+  const timer = handleClaudeStopFailureReport(msg.report, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt }, {
+    owner: { cliPid: bridgeCliPid, cliSessionIds, transcriptPath: bridgeJsonlPath },
+    activeTurn: { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
+    schedule: (delayMs, run) => setTimeout(run, delayMs),
+    catchUp: () => { if (bridgeJsonlPath) bridgeIngest(); },
+    isSettled: (turnId, dispatchAttempt) => emittedTurnTerminals.has(sessionId, turnId, dispatchAttempt),
+    cliIdle: () => isPromptReady,
+    lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
+    now: Date.now,
+    emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
+      emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
+    },
+    notify: (errorCode, replyTurnId) => {
+      send({
+        type: 'user_notify',
+        ...(replyTurnId ? { turnId: replyTurnId } : {}),
+        message: t('worker.claude_stop_failure_unsettled', { cliName: cliName(), errorCode }),
+      });
+      lastTurnFailureSurfacedAtMs = Date.now();
+    },
+    log,
+  });
+  timer?.unref?.();
+}
+
 /** Claude transcript turn boundary, for the stale OSC 7501 fallback below. */
 const claudeTranscriptTurnEnd = new ClaudeTranscriptTurnEnd();
 let staleProgramStatusTimer: ReturnType<typeof setTimeout> | null = null;
@@ -26949,6 +26991,9 @@ if(isTouch&&hasToken){(function(){
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 const emittedTurnTerminals = new TurnTerminalDeduper();
+/** When a failed/ambiguous terminal or failure notice last went out: lets a
+ *  Claude StopFailure report tell whether anything surfaced its failure. */
+let lastTurnFailureSurfacedAtMs: number | undefined;
 /** Opens at each turn's literal CLI write, closes at its terminal. See
  *  turn-execution-clock.ts for why queueing time is deliberately excluded. */
 const turnExecutionClock = new TurnExecutionClock();
@@ -26989,6 +27034,7 @@ function emitTurnTerminal(
     turnExecutionClock.forget(turnId, dispatchAttempt);
     return;
   }
+  if (status !== 'completed') lastTurnFailureSurfacedAtMs = Date.now();
   traexAutoModelController?.endTurn(turnId);
   const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
   if (status !== 'completed') {
@@ -28749,6 +28795,11 @@ process.on('message', async (raw: unknown) => {
       }
       log(`Turn-idle report accepted (turn=${msg.turnId} seq=${msg.seq ?? '?'} pid=${msg.pid ?? '?'}) — firing structured idle`);
       idleDetector?.fireIdle();
+      break;
+    }
+
+    case 'claude_stop_failure': {
+      handleClaudeStopFailure(msg);
       break;
     }
 
