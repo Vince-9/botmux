@@ -6,16 +6,23 @@
  * stdin payload and the transcript's API-error record. Paths and ids are
  * neutralised; field names and values are as captured.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
+import { existsSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   claudeStopFailureBelongsToOwner,
   classifyClaudeStopFailure,
   CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS,
+  CLAUDE_STOP_FAILURE_OUTBOX_MAX_AGE_MS,
+  CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX,
   decideClaudeStopFailureFallback,
+  drainClaudeStopFailureOutbox,
   handleClaudeStopFailureReport,
   normalizeClaudeStopFailureReport,
   parseClaudeStopFailureHookInput,
   type ClaudeStopFailureReport,
+  writeClaudeStopFailureOutboxReport,
 } from '../src/services/claude-stop-failure.js';
 import { classifyClaudeTerminalEvent, type TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -211,6 +218,7 @@ describe('handleClaudeStopFailureReport', () => {
       },
       settledStatus: (turnId: string) => settled.get(turnId),
       cliIdle: () => idle,
+      isKnownTurn: (turnId: string) => ['om_failed', 'om_older', 'om_next'].includes(turnId),
       lastFailureSurfacedAtMs: () => surfacedAt,
       now: () => clock,
       advance: (ms: number) => { clock += ms; },
@@ -294,6 +302,32 @@ describe('handleClaudeStopFailureReport', () => {
     expect(notices).toEqual([['provider_server_error', 'om_older']]);
   });
 
+  it('replies to the session default when the claimed turn is one this worker does not know', () => {
+    const { ctx, timers, notices } = harness();
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_from_elsewhere' }, ctx);
+    timers[0].run();
+    expect(notices).toEqual([['provider_server_error', undefined]]);
+  });
+
+  it('a notify-only report never settles a turn, even an open one on an idle CLI', () => {
+    // The relay outbox: the sandbox controls those bytes.
+    const { ctx, timers, emitted, notices } = harness();
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx, { notifyOnly: true });
+    timers[0].run();
+    expect(emitted).toEqual([]);
+    expect(notices).toEqual([['provider_server_error', 'om_failed']]);
+  });
+
+  it('a notify-only report stays quiet once the failed turn has its failed terminal', () => {
+    const { ctx, timers, notices } = harness({ settled: 'failed' });
+    ctx.lastFailureSurfacedAtMs = () => ctx.now() - 10 * CLAUDE_STOP_FAILURE_SETTLE_GRACE_MS;
+    // The claim names the failed turn; the worker already moved on to the next input.
+    ctx.activeTurn = { turnId: 'om_next', dispatchAttempt: undefined };
+    handleClaudeStopFailureReport(fromDrivenCli, { turnId: 'om_failed' }, ctx, { notifyOnly: true });
+    timers[0].run();
+    expect(notices).toEqual([]);
+  });
+
   it('ignores a nested `claude -p` entirely', () => {
     const { ctx, timers } = harness();
     handleClaudeStopFailureReport(
@@ -310,5 +344,46 @@ describe('handleClaudeStopFailureReport', () => {
     timers[0].run();
     expect(emitted).toEqual([]);
     expect(notices).toEqual([]);
+  });
+});
+
+describe('relay outbox reports', () => {
+  const dirs: string[] = [];
+  afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+  const outbox = () => { const dir = mkdtempSync(join(tmpdir(), 'botmux-stop-failure-outbox-')); dirs.push(dir); return dir; };
+  const NOW = 1_800_000_000_000;
+
+  it('round-trips a report and consumes it', () => {
+    const dir = outbox();
+    writeClaudeStopFailureOutboxReport(dir, report({ cliSessionId: SESSION_ID, claudePid: 42 }), { turnId: 'om_failed', now: NOW });
+    expect(drainClaudeStopFailureOutbox(dir, NOW + 1_000)).toEqual([{
+      report: report({ cliSessionId: SESSION_ID, claudePid: 42 }),
+      turnId: 'om_failed',
+      atMs: NOW,
+    }]);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(drainClaudeStopFailureOutbox(dir, NOW + 2_000)).toEqual([]);
+  });
+
+  it('drops stale, future-dated, malformed and oversized reports, and leaves other files alone', () => {
+    const dir = outbox();
+    writeClaudeStopFailureOutboxReport(dir, report(), { now: NOW - CLAUDE_STOP_FAILURE_OUTBOX_MAX_AGE_MS - 1 });
+    writeClaudeStopFailureOutboxReport(dir, report(), { now: NOW + 60_000 });
+    writeFileSync(join(dir, `bad${CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX}`), 'not json');
+    writeFileSync(join(dir, `noerror${CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX}`), JSON.stringify({ v: 1, atMs: NOW, report: {} }));
+    writeFileSync(join(dir, `huge${CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX}`), JSON.stringify({ v: 1, atMs: NOW, report: report(), pad: 'x'.repeat(64 * 1024) }));
+    writeFileSync(join(dir, 'abc.req.json'), '{}');
+    expect(drainClaudeStopFailureOutbox(dir, NOW)).toEqual([]);
+    expect(readdirSync(dir)).toEqual(['abc.req.json']);
+  });
+
+  it('never follows a symlink planted in place of a report', () => {
+    const dir = outbox();
+    const secret = join(outbox(), 'host-file.json');
+    writeFileSync(secret, JSON.stringify({ v: 1, atMs: NOW, report: report() }));
+    symlinkSync(secret, join(dir, `link${CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX}`));
+    expect(drainClaudeStopFailureOutbox(dir, NOW)).toEqual([]);
+    expect(readdirSync(dir)).toEqual([]);
+    expect(existsSync(secret)).toBe(true);
   });
 });

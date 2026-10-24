@@ -10,12 +10,16 @@
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import {
+  CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX,
+  drainClaudeStopFailureOutbox,
+} from '../src/services/claude-stop-failure.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const tempDirs: string[] = [];
@@ -58,6 +62,7 @@ function runHook(
 
 async function withServer(
   run: (port: number, received: { url: string; body: string }) => Promise<void>,
+  status = 200,
 ): Promise<void> {
   const received = { url: '', body: '' };
   const server = createServer((req, res) => {
@@ -65,8 +70,8 @@ async function withServer(
     req.setEncoding('utf8');
     req.on('data', chunk => { received.body += chunk; });
     req.on('end', () => {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end('{"ok":true}');
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(status === 200 ? '{"ok":true}' : '{"ok":false,"error":"origin_unproven"}');
     });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -77,6 +82,10 @@ async function withServer(
       server.close(err => err ? reject(err) : resolve());
     });
   }
+}
+
+function relayOf(env: NodeJS.ProcessEnv): string[] {
+  return readdirSync(env.BOTMUX_SEND_RELAY!).filter(name => name.endsWith(CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX));
 }
 
 function sessionEnv(port: number): NodeJS.ProcessEnv {
@@ -105,9 +114,12 @@ function sessionEnv(port: number): NodeJS.ProcessEnv {
 describe('botmux __claude-stop-failure-v1', () => {
   it('forwards the error type and the firing CLI identity with the session capability', async () => {
     await withServer(async (port, received) => {
-      const result = await runHook(sessionEnv(port), JSON.stringify(payload));
+      const env = sessionEnv(port);
+      const result = await runHook(env, JSON.stringify(payload));
       expect(result).toEqual({ status: 0, stdout: '', stderr: '' });
       expect(received.url).toBe('/api/claude-stop-failure');
+      // Delivered: nothing goes to the relay outbox.
+      expect(relayOf(env)).toEqual([]);
       expect(JSON.parse(received.body)).toMatchObject({
         sessionId: 'sess_stop_failure_test',
         originCapability: 'a'.repeat(64),
@@ -119,6 +131,39 @@ describe('botmux __claude-stop-failure-v1', () => {
         claudePid: 4242,
       });
     });
+  });
+
+  it('falls back to the relay outbox when the daemon refuses the (revoked) turn capability', async () => {
+    await withServer(async (port, received) => {
+      const env = sessionEnv(port);
+      const result = await runHook(env, JSON.stringify(payload));
+      expect(result).toEqual({ status: 0, stdout: '', stderr: '' });
+      expect(received.url).toBe('/api/claude-stop-failure');
+      expect(drainClaudeStopFailureOutbox(env.BOTMUX_SEND_RELAY!)).toEqual([{
+        report: {
+          error: 'server_error',
+          lastAssistantMessage: payload.last_assistant_message,
+          cliSessionId: SESSION_ID,
+          transcriptPath: payload.transcript_path,
+          claudePid: 4242,
+        },
+        turnId: 'om_failed_turn',
+        atMs: expect.any(Number),
+      }]);
+    }, 403);
+  });
+
+  it('has no outbox to fall back to outside a sandbox', async () => {
+    await withServer(async port => {
+      const env = sessionEnv(port);
+      const relay = env.BOTMUX_SEND_RELAY!;
+      delete env.BOTMUX_SEND_RELAY;
+      // Keep the client off this host's real daemon secret.
+      env.HOME = env.USERPROFILE = mkdtempSync(join(tmpdir(), 'botmux-stop-failure-home-'));
+      tempDirs.push(env.HOME);
+      expect(await runHook(env, JSON.stringify(payload))).toEqual({ status: 0, stdout: '', stderr: '' });
+      expect(readdirSync(relay).filter(name => name.endsWith(CLAUDE_STOP_FAILURE_OUTBOX_SUFFIX))).toEqual([]);
+    }, 403);
   });
 
   it('sends nothing for a payload that is not a StopFailure with an error type', async () => {

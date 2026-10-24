@@ -180,7 +180,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
+import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import {
   appendBridgeTurnJournalEntry,
@@ -18518,7 +18518,10 @@ function postTerminalPromptFenceHolds(
  *  after a grace period the hook settles the open turn instead — the daemon
  *  then continues or reports it like any other failed terminal — or, with no
  *  open turn left, tells the chat. See services/claude-stop-failure.ts. */
-function handleClaudeStopFailure(msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>): void {
+function handleClaudeStopFailure(
+  msg: Extract<DaemonToWorker, { type: 'claude_stop_failure' }>,
+  opts: { notifyOnly?: boolean } = {},
+): void {
   if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) {
     log(`Ignoring Claude StopFailure (${msg.report.error}): not a botmux-driven Claude session`);
     return;
@@ -18534,6 +18537,8 @@ function handleClaudeStopFailure(msg: Extract<DaemonToWorker, { type: 'claude_st
     catchUp: () => { if (bridgeJsonlPath) bridgeIngest(); },
     settledStatus: (turnId, dispatchAttempt) => emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt),
     cliIdle: () => isPromptReady,
+    isKnownTurn: turnId => turnId === currentBotmuxTurnId || retiredTurnIds.has(turnId)
+      || queuedTypeAheadTurns.some(queued => queued.turnId === turnId),
     lastFailureSurfacedAtMs: () => lastTurnFailureSurfacedAtMs,
     now: Date.now,
     emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
@@ -18548,9 +18553,23 @@ function handleClaudeStopFailure(msg: Extract<DaemonToWorker, { type: 'claude_st
       lastTurnFailureSurfacedAtMs = Date.now();
     },
     log,
-  });
+  }, opts);
   timer?.unref?.();
 }
+
+/** An isolated session's hook client falls back to the relay outbox once the
+ *  daemon refused its revoked turn capability; those reports may only notify.
+ *  See the relay-outbox section of services/claude-stop-failure.ts. */
+setInterval(() => {
+  const outbox = sandboxRelayOutbox;
+  if (!outbox || !cliAdapter?.claudeDataDir) return;
+  for (const entry of drainClaudeStopFailureOutbox(outbox)) {
+    handleClaudeStopFailure(
+      { type: 'claude_stop_failure', report: entry.report, ...(entry.turnId ? { turnId: entry.turnId } : {}) },
+      { notifyOnly: true },
+    );
+  }
+}, 1_000).unref?.();
 
 /** Claude transcript turn boundary, for the stale OSC 7501 fallback below. */
 const claudeTranscriptTurnEnd = new ClaudeTranscriptTurnEnd();
