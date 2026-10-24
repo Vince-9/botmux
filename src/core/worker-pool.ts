@@ -818,6 +818,7 @@ import {
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
 import { truncateUtf16WellFormed } from '../utils/unicode.js';
+import { recentCliUpgrade } from './cli-version-history.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -14682,6 +14683,12 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
+    // Lets a startup-stall notice say "just upgraded to x.y.z".
+    cliUpgrade: recentCliUpgrade(runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,

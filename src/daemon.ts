@@ -485,6 +485,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
+import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
 import { parseTopicHeader, isTopicHeader, isTopicHeaderError, topicHeaderDeclaresSpec } from './core/topic-header.js';
 import { resolveTopicSpec, type TopicSpec } from './core/topic-spec.js';
@@ -5359,10 +5360,17 @@ function refreshCliVersion(botCfg: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cli
     const oldVersion = cached?.version;
     cliVersionCache.set(key, { version: newVersion, lastCheckAt: now });
     setCurrentCliVersion(newVersion, key);
+    // Persisted so an upgrade that happened while the daemon was down is still
+    // known as one (startup-stall notices quote it).
+    const record = noteObservedCliVersion(key, newVersion, { nowMs: now });
 
     if (oldVersion && oldVersion !== newVersion) {
       logger.info(`CLI version updated: ${oldVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
       return true;
+    }
+    if (!oldVersion && record?.previousVersion && record.changedAtMs === now) {
+      logger.info(`CLI version changed since last seen: ${record.previousVersion} → ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
+      return false;
     }
 
     logger.info(`CLI version: ${newVersion} (${botCfg.cliRuntime?.displayName ?? adapter.id})`);
