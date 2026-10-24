@@ -1975,6 +1975,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App shared turn (synced to Lark)',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 Decision board: received {count} decision(s) (batch #{id}); the steward is on it',
   'scheduler.task_started': '🕐 Scheduled task “{name}” started',
   'scheduler.task_triggered_target_chat': '🕐 Scheduled task “{name}” triggered in the target chat\nOpen target chat: {link}',
   'scheduler.task_triggered_target_thread': '🕐 Scheduled task “{name}” triggered in the target topic\nOpen target topic: {link}',

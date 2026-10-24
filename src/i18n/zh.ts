@@ -1976,6 +1976,7 @@ export const messages: Record<string, string> = {
   'card.codex_app_shared_turn': '🖥️ Codex App 共享对话（已同步至飞书）',
 
   // Scheduler announcements
+  'decisionBoard.batch_banner': '📥 决策看板：收到 {count} 项决定（批次 #{id}），管家开始处理',
   'scheduler.task_started': '🕐 定时任务「{name}」开始执行',
   'scheduler.task_triggered_target_chat': '🕐 定时任务「{name}」已在目标群聊触发\n打开目标群聊：{link}',
   'scheduler.task_triggered_target_thread': '🕐 定时任务「{name}」已在目标话题触发\n打开目标话题：{link}',
