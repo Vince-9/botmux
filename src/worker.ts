@@ -408,6 +408,7 @@ import { delay } from './utils/timing.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
+import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
@@ -18886,11 +18887,18 @@ function viewportShowsIdlePrompt(be: SessionBackend): boolean {
   }
 }
 
+/** 构造 CLI 进程存活探针：worker 持有的 pane 子进程（spawn 时同步绑定的
+ * cliPid，或 tmux pane 的实时子进程）。拿不到 pid 时返回 undefined，让适配
+ * 器回退到自身的状态库时效窗口。实现见 adapters/cli/backend-liveness.ts。 */
+function cliProcessAliveProbe(be: SessionBackend): () => boolean | undefined {
+  return () => cliProcessAliveFromBackend(be);
+}
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
     cliSessionId: currentCliSid,
+    isCliProcessAlive: cliProcessAliveProbe(be),
     getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
       ? () => captureBackendScreen(be) : undefined,
   })) {
@@ -18922,6 +18930,7 @@ function probeBusyPatternIdle(
   if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
     sessionId,
     cliSessionId: currentCliSid,
+    isCliProcessAlive: cliProcessAliveProbe(be),
     getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
       ? () => captureBackendScreen(be) : undefined,
   })) {
