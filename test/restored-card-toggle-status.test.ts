@@ -1,13 +1,14 @@
 /**
- * 「显示 / 隐藏输出」 re-renders the streaming card from cached daemon state.
+ * 「显示 / 隐藏输出」, 「刷新」 and the terminal keys re-render the streaming card
+ * from cached daemon state — its status, and its Web Terminal link.
  *
  * `lastScreenStatus` lives only in memory: a session restored after a daemon
  * restart has none, and a worker that dies mid-turn leaves its last one behind.
- * With no worker there is no CLI behind the card, so a toggle must not bring
+ * With no worker there is no CLI behind the card, so a click must not bring
  * back 「工作中」 and a 「⏹ 停止」 button — the restart-time reconcile has just
- * set that card to 「等待输入」, and the toggle used to undo it.
+ * set that card to 「等待输入」, and the click used to undo it.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 const updateMessageMock = vi.fn(async (..._args: any[]) => {});
@@ -79,10 +80,12 @@ import {
   reconcileRestoredStreamingCardStatus,
   setActiveSessionsRegistry,
   transferSession,
+  workerHasInitialized,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, sessionKey, type DaemonSession, type FrozenCard } from '../src/core/types.js';
 import { t } from '../src/i18n/index.js';
+import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 const APP_ID = 'app_test';
 const ROOT_ID = 'om_root';
@@ -96,6 +99,7 @@ const STARTING = label('card.status.starting');
 const LIMITED = label('card.status.limited');
 const STOP = label('card.btn.stop');
 const UNAVAILABLE = label('card.status.screenshot_unavailable');
+const FAILED = label('card.status.idle_failed');
 
 function makeFakeWorker() {
   const w = new EventEmitter() as any;
@@ -123,7 +127,6 @@ function makeRestoredDs(overrides?: Partial<DaemonSession>): DaemonSession {
       chatType: 'group',
     },
     worker: null,
-    workerReady: false,
     workerPort: null,
     workerToken: null,
     larkAppId: APP_ID,
@@ -151,20 +154,25 @@ function activate(ds: DaemonSession): CardHandlerDeps {
   return { activeSessions: sessions, sessionReply: vi.fn(async () => 'om_new'), lastRepoScan: new Map() } as any;
 }
 
-function toggle(cardNonce = NONCE, messageId = CARD_ID) {
+function cardClick(action: string, extra: Record<string, unknown> = {}, cardNonce = NONCE, messageId = CARD_ID) {
   return {
     action: {
       value: {
-        action: 'toggle_display',
+        action,
         root_id: ROOT_ID,
         session_id: 'sid-toggle-status',
         card_nonce: cardNonce,
         stream_card_version: STREAMING_CARD_PATCH_VERSION,
+        ...extra,
       },
     },
     operator: { open_id: 'ou_user' },
     context: { open_message_id: messageId },
   };
+}
+
+function toggle(cardNonce = NONCE, messageId = CARD_ID) {
+  return cardClick('toggle_display', {}, cardNonce, messageId);
 }
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -325,6 +333,60 @@ describe('toggle status without a fresh worker report', () => {
     expect(statusOf(card)).toBe(WORKING);
     expect(hasStopButton(card)).toBe(true);
   });
+
+  it('worker gone after a failed turn → keeps 执行失败', async () => {
+    // failedIdleTurnId is runtime-only and the exit path keeps it.
+    const ds = makeRestoredDs({ failedIdleTurnId: 'turn-failed' });
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(statusOf(card)).toBe(FAILED);
+    expect(hasStopButton(card)).toBe(false);
+  });
+});
+
+describe('刷新 / terminal keys on a restored session', () => {
+  // A daemon shutdown drops ds.worker before the worker's exit event, so the
+  // exit path never clears the persisted Web Terminal port. Restore keeps it and
+  // leaves workerReady unset, which workerHasInitialized() reads as a ready
+  // worker — so these clicks rebuild the card even though no CLI runs.
+  const restoredWithWebPort = (overrides?: Partial<DaemonSession>): DaemonSession => {
+    const ds = makeRestoredDs({ displayMode: 'screenshot', ...overrides });
+    Object.assign(ds.session, { backendType: 'tmux', webPort: 31219 });
+    return ds;
+  };
+  const clicks: Array<[string, Record<string, unknown>]> = [
+    ['refresh_screenshot', {}],
+    ['term_action', { key: 'esc' }],
+  ];
+
+  it.each(clicks)('%s keeps 等待输入, with no stop button', async (action, extra) => {
+    const ds = restoredWithWebPort();
+    expect(workerHasInitialized(ds)).toBe(true);
+    const card: any = await handleCardAction(cardClick(action, extra), activate(ds), APP_ID);
+    expect(statusOf(card)).toBe(IDLE);
+    expect(hasStopButton(card)).toBe(false);
+    expect(ds.lastScreenStatus).toBeUndefined();
+  });
+
+  it.each(clicks)('%s on a restored usage-limited session keeps 限额已达 with its retry time', async (action, extra) => {
+    // Restore puts a persisted limit back as lastScreenStatus = 'limited'.
+    const ds = restoredWithWebPort({
+      lastScreenStatus: 'limited',
+      usageLimit: { limited: true, kind: 'usage', retryAtMs: Date.now() + 3_600_000, retryLabel: '23:59', retryReady: false },
+    });
+    const card: any = await handleCardAction(cardClick(action, extra), activate(ds), APP_ID);
+    expect(statusOf(card)).toBe(LIMITED);
+    expect(markdownOf(card).some(md => md.includes('23:59'))).toBe(true);
+    expect(hasStopButton(card)).toBe(false);
+  });
+
+  it.each(clicks)('%s on a running worker still shows 工作中 with the stop button', async (action, extra) => {
+    const worker = makeFakeWorker();
+    const ds = restoredWithWebPort({ worker, workerReady: true, lastScreenStatus: 'working' });
+    const card: any = await handleCardAction(cardClick(action, extra), activate(ds), APP_ID);
+    expect(statusOf(card)).toBe(WORKING);
+    expect(hasStopButton(card)).toBe(true);
+    expect(worker.send).toHaveBeenCalled();
+  });
 });
 
 describe('historical cards with no worker', () => {
@@ -343,5 +405,48 @@ describe('historical cards with no worker', () => {
     expect(statusOf(result)).toBe(IDLE);
     expect(hasStopButton(result)).toBe(false);
     expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('Web Terminal link on a restored session', () => {
+  // A daemon shutdown leaves the last worker's port persisted (it is also the
+  // next fork's preferred listen port), so a restored session still carries it.
+  const PERSISTED_PORT = 31219;
+  const OPEN = label('card.btn.open_terminal');
+  const terminalLinkOf = (card: any): string | undefined =>
+    buttonsOf(card).find(b => b.text?.content === OPEN)?.multi_url?.url;
+  const restored = (overrides?: Partial<DaemonSession>): DaemonSession => {
+    const ds = makeRestoredDs(overrides);
+    Object.assign(ds.session, { backendType: 'tmux', webPort: PERSISTED_PORT });
+    return ds;
+  };
+
+  afterEach(() => resetTerminalProxy());
+
+  it('direct link: no link to the previous daemon\'s port, which stays persisted', async () => {
+    const ds = restored();
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(`:${PERSISTED_PORT}`);
+    expect(ds.session.webPort).toBe(PERSISTED_PORT);
+  });
+
+  it('through the terminal proxy: keeps the session link, which wakes a worker', async () => {
+    setTerminalProxyPort(17_700);
+    const ds = restored();
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toContain(`:17700/s/${ds.session.sessionId}`);
+  });
+
+  it('direct link with a running worker points at its port', async () => {
+    const ds = restored({ worker: makeFakeWorker(), workerReady: true, workerPort: 40_001, lastScreenStatus: 'idle' });
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toContain(':40001');
+  });
+
+  it('direct link for a worker that has not reported its port yet uses the preferred one', async () => {
+    const ds = restored({ worker: makeFakeWorker() });
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(terminalLinkOf(card)).toContain(`:${PERSISTED_PORT}`);
   });
 });
